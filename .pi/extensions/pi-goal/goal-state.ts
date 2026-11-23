@@ -1,3 +1,5 @@
+import type { RunWait } from "./subagent-wait";
+
 export type GoalStatus = "active" | "paused" | "budget_limited" | "complete";
 
 export type GoalState = {
@@ -10,6 +12,7 @@ export type GoalState = {
 	timeUsedSeconds: number;
 	createdAt: number;
 	updatedAt: number;
+	wait?: RunWait;
 };
 
 export type GoalEventKind = "active" | "continuation" | "paused" | "resumed" | "cleared" | "budget_limited" | "complete";
@@ -58,6 +61,9 @@ export function formatElapsed(seconds: number): string {
 export function statusLine(state: GoalState | null): string | undefined {
 	if (!state) return undefined;
 	const budget = state.tokenBudget ? ` (${formatTokens(state.tokensUsed)} / ${formatTokens(state.tokenBudget)})` : ` (${formatElapsed(state.timeUsedSeconds)})`;
+	if (state.status === "active" && state.wait) return state.wait.pending.length
+		? `Goal waiting on ${state.wait.pending.length} subagent run(s)${budget}`
+		: "Goal blocked on subagent results (/goal resume)";
 	if (state.status === "active") return `Pursuing goal${budget}`;
 	if (state.status === "paused") return "Goal paused (/goal resume)";
 	if (state.status === "budget_limited") return state.tokenBudget ? `Goal unmet${budget}` : "Goal abandoned";

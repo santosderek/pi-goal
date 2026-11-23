@@ -1,5 +1,5 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { Box, Spacer, Text } from "@mariozechner/pi-tui";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Box, Spacer, Text } from "@earendil-works/pi-tui";
 import {
 	accountGoalTurn,
 	createGoalState,
@@ -14,9 +14,14 @@ import {
 	normalizeTokenBudget,
 } from "./goal-state";
 import { tokenDeltaFromUsage, type UsageSnapshot } from "./usage";
+import { applyNotice, isRunId, launchedRuns, MAX_WAIT_RUNS, readRunState, record, settleRun, type RunWait } from "./subagent-wait";
 
 const CUSTOM_TYPE = "pi-goal";
 const EVENT_TYPE = "pi-goal-event";
+
+function toolError(text: string) {
+	return { content: [{ type: "text" as const, text }], isError: true, details: {} };
+}
 
 let goal: GoalState | null = null;
 let statusBarEnabled = true;
@@ -87,7 +92,7 @@ function updateStatusBar(ctx: ExtensionContext) {
 	ctx.ui.setStatus(CUSTOM_TYPE, statusBarEnabled ? statusLine(goal) ?? "" : "");
 }
 
-const ACTIVE_GOAL_TOOL_NAMES = ["get_goal", "update_goal"];
+const ACTIVE_GOAL_TOOL_NAMES = ["get_goal", "update_goal", "goal_wait_for_runs"];
 
 // Expose read/update tools to the LLM only while a goal is actively being pursued.
 // Keep create_goal available so the model can set or replace a goal when explicitly asked.
@@ -132,6 +137,7 @@ Budget:
 - Tokens remaining: ${remainingTokens}
 
 Avoid repeating work that is already done. Choose the next concrete action toward the objective.
+If only already-launched native async subagent runs can unblock the next step, use goal_wait_for_runs with their exact IDs and yield. Do not poll, relaunch, or treat a notice for one run as completion of the whole batch. Verify results before using them.
 
 Before deciding that the goal is achieved, perform a completion audit against the actual current state:
 - Restate the objective as concrete deliverables or success criteria.
@@ -167,16 +173,56 @@ Do not call update_goal unless the goal is actually complete.`;
 }
 
 function queueContinuation(pi: ExtensionAPI, state: GoalState) {
-	if (continuationQueued || state.status !== "active") return;
+	if (continuationQueued || state.status !== "active" || state.wait) return;
 	continuationQueued = true;
 	queueMicrotask(() => {
 		continuationQueued = false;
-		if (!goal || goal.id !== state.id || goal.status !== "active") return;
+		if (!goal || goal.id !== state.id || goal.status !== "active" || goal.wait) return;
 		emitGoalEvent(pi, "continuation", goal, { triggerTurn: true, deliverAs: "followUp" });
 	});
 }
 
+function foldRecordedNotices(ctx: ExtensionContext, wait: RunWait): RunWait {
+	for (const entry of ctx.sessionManager.getBranch()) {
+		if (entry.type === "custom_message") wait = applyNotice(wait, entry);
+		if (entry.type === "message") wait = applyNotice(wait, entry.message);
+	}
+	return wait;
+}
+
+function allSucceeded(wait: RunWait) {
+	return wait.pending.length === 0 && Object.values(wait.settled).every((state) => state === "complete");
+}
+
+function waitDescription(wait: RunWait) {
+	const settled = Object.entries(wait.settled).map(([id, state]) => `${id}: ${state}`).join(", ");
+	return [wait.pending.length ? `Pending: ${wait.pending.join(", ")}.` : "No tracked run is pending.", settled ? `Settled: ${settled}.` : ""].filter(Boolean).join(" ");
+}
+
+async function reconcileWait(pi: ExtensionAPI, ctx: ExtensionContext, wait: RunWait) {
+	let next = foldRecordedNotices(ctx, wait);
+	const statuses = await Promise.all(next.pending.map(async (id) => [id, await readRunState(pi.events, id)] as const));
+	// A native notice can arrive while the RPCs are in flight. Prefer the
+	// delivered result, and never overwrite a terminal outcome with stale status.
+	next = foldRecordedNotices(ctx, next);
+	for (const [id, state] of statuses) {
+		if (state) next = settleRun(next, id, state);
+	}
+	return { wait: next, unknown: statuses.filter(([id, state]) => !state && next.pending.includes(id)).map(([id]) => id) };
+}
+
 export default function piGoal(pi: ExtensionAPI) {
+	function onCompletion(ctx: ExtensionContext, message?: unknown) {
+		if (goal?.status !== "active" || !goal.wait || goal.wait.sessionId !== ctx.sessionManager.getSessionId()) return;
+		const next = message ? applyNotice(goal.wait, message) : foldRecordedNotices(ctx, goal.wait);
+		if (next === goal.wait) return;
+		persist(pi, ctx, { ...goal, wait: allSucceeded(next) ? undefined : next, updatedAt: Date.now() });
+		// No triggerTurn: pi-subagents owns delivery and the wake for this notice.
+		if (!next.pending.length && !allSucceeded(next)) {
+			ctx.ui.notify(`Goal blocked on subagent results. ${waitDescription(next)} Use /goal resume after deciding how to proceed.`, "warning");
+		}
+	}
+
 	pi.registerMessageRenderer(EVENT_TYPE, (message, { expanded }, theme) => {
 		const details = message.details as { kind?: GoalEventKind; goal?: GoalState | null; timestamp?: number } | undefined;
 		const kind = details?.kind ?? "continuation";
@@ -248,14 +294,11 @@ export default function piGoal(pi: ExtensionAPI) {
 			additionalProperties: false,
 		} as any,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const objective = typeof params.objective === "string" ? params.objective.trim() : "";
-			if (!objective) {
-				return { content: [{ type: "text", text: "objective is required." }], isError: true };
-			}
-			const parsedBudget = normalizeTokenBudget(params.tokenBudget);
-			if (parsedBudget.error) {
-				return { content: [{ type: "text", text: parsedBudget.error }], isError: true };
-			}
+			const input = record(params);
+			const objective = typeof input?.objective === "string" ? input.objective.trim() : "";
+			if (!objective) return toolError("objective is required.");
+			const parsedBudget = normalizeTokenBudget(input?.tokenBudget);
+			if (parsedBudget.error) return toolError(parsedBudget.error);
 			const next = createGoalState(objective, parsedBudget.tokenBudget);
 			persist(pi, ctx, next);
 			emitGoalEvent(pi, "active", next, { triggerTurn: ctx.isIdle() });
@@ -263,6 +306,46 @@ export default function piGoal(pi: ExtensionAPI) {
 				content: [{ type: "text", text: JSON.stringify({ goal: next, remainingTokens: next.tokenBudget }, null, 2) }],
 				details: { goal: next },
 			};
+		},
+	});
+
+	pi.registerTool({
+		name: "goal_wait_for_runs",
+		label: "Wait for Goal Subagents",
+		description: "Suspend automatic goal continuations until specific already-launched async subagent runs settle. Returns immediately; native subagent notices wake the parent.",
+		promptSnippet: "Park an active goal on exact async subagent run IDs when no independent work remains",
+		parameters: {
+			type: "object",
+			properties: { runIds: { type: "array", minItems: 1, maxItems: MAX_WAIT_RUNS, uniqueItems: true, items: { type: "string" } } },
+			required: ["runIds"],
+			additionalProperties: false,
+		} as any,
+		async execute(_id, params, signal, _onUpdate, ctx) {
+			if (goal?.status !== "active") return toolError("No active goal to wait on.");
+			if (goal.wait) return toolError(`This goal already has a wait. ${waitDescription(goal.wait)} Do not replace or relaunch its runs.`);
+			const ids = record(params)?.runIds;
+			if (!Array.isArray(ids) || !ids.length || ids.length > MAX_WAIT_RUNS || !ids.every(isRunId) || new Set(ids).size !== ids.length) {
+				return toolError(`Provide 1–${MAX_WAIT_RUNS} distinct exact async run IDs.`);
+			}
+			const launched = launchedRuns(ctx.sessionManager.getBranch());
+			if (!ids.every((id) => launched.has(id))) return toolError("Use exact async IDs from successful subagent launches on this session branch.");
+			const goalId = goal.id;
+			const sessionId = ctx.sessionManager.getSessionId();
+			const { wait, unknown } = await reconcileWait(pi, ctx, { sessionId, pending: ids, settled: {} });
+			if (signal?.aborted || goal?.id !== goalId || goal.status !== "active" || goal.wait || ctx.sessionManager.getSessionId() !== sessionId) {
+				return toolError("Goal changed while checking subagent status; no wait was installed.");
+			}
+			if (unknown.length) {
+				// Preserve the barrier even if RPC is missing or status is ambiguous.
+				// Native notices can still settle it; /goal resume can reconcile later.
+				ctx.ui.notify(`Could not reconcile subagent status for: ${unknown.join(", ")}. Waiting for native notices.`, "warning");
+			}
+			if (!allSucceeded(wait)) persist(pi, ctx, { ...goal, wait, updatedAt: Date.now() });
+			const guidance = wait.pending.length
+				? "Yield if no independent work remains. Native notices may arrive separately. Do not poll or relaunch."
+				: allSucceeded(wait) ? "All tracked runs settled successfully; inspect the actual results before proceeding."
+					: "The goal is blocked. Report the unsuccessful runs; do not retry automatically. The user can decide how to proceed with /goal resume.";
+			return { content: [{ type: "text", text: `${waitDescription(wait)} ${guidance}` }], details: { wait, unknown } };
 		},
 	});
 
@@ -288,11 +371,10 @@ export default function piGoal(pi: ExtensionAPI) {
 			additionalProperties: false,
 		} as any,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			if (params.status !== "complete") {
-				return { content: [{ type: "text", text: "update_goal only accepts status=complete." }], isError: true };
-			}
-			if (!goal) {
-				return { content: [{ type: "text", text: "No goal is set." }], isError: true };
+			if (record(params)?.status !== "complete") return toolError("update_goal only accepts status=complete.");
+			if (!goal) return toolError("No goal is set.");
+			if (goal.status !== "active" || goal.wait) {
+				return toolError("Only an active goal without a pending or blocked subagent wait can be completed.");
 			}
 			const now = Date.now();
 			const next: GoalState = { ...goal, status: "complete", updatedAt: now };
@@ -318,7 +400,7 @@ export default function piGoal(pi: ExtensionAPI) {
 
 			if (!trimmed || trimmed === "status") {
 				if (!goal) ctx.ui.notify("Usage: /goal [--tokens 50k] <objective>", "info");
-				else ctx.ui.notify(`${statusLine(goal)}\nObjective: ${goal.objective}\nStatus bar: ${statusBarEnabled ? "on" : "off"}`, "info");
+				else ctx.ui.notify(`${statusLine(goal)}\nObjective: ${goal.objective}${goal.wait ? `\n${waitDescription(goal.wait)}` : ""}\nStatus bar: ${statusBarEnabled ? "on" : "off"}`, "info");
 				return;
 			}
 
@@ -347,8 +429,29 @@ export default function piGoal(pi: ExtensionAPI) {
 					return;
 				}
 				const status: GoalStatus = trimmed === "pause" ? "paused" : "active";
-				const next = { ...goal, status, updatedAt: now };
+				const prior = goal;
+				let wait = prior.wait;
+				let reconciledSummary: string | undefined;
+				if (status === "active" && wait) {
+					if (wait.sessionId !== ctx.sessionManager.getSessionId()) {
+						ctx.ui.notify("This wait belongs to a different session. Use /goal clear to discard it; no subagents were relaunched.", "warning");
+						return;
+					}
+					const checked = await reconcileWait(pi, ctx, wait);
+					if (goal !== prior) return;
+					wait = checked.wait;
+					reconciledSummary = waitDescription(wait);
+					if (!wait.pending.length) wait = undefined;
+				}
+				const next = { ...prior, wait, status, updatedAt: now };
 				persist(pi, ctx, next);
+				if (status === "active" && wait) {
+					ctx.ui.notify(`Goal still waiting. ${waitDescription(wait)}`, "info");
+					return;
+				}
+				if (reconciledSummary) {
+					pi.sendMessage({ customType: "pi-goal-wait-result", content: `Reconciled subagent wait. ${reconciledSummary} Verify actual results before proceeding; unsuccessful runs are not completed work.`, display: true });
+				}
 				emitGoalEvent(pi, status === "active" ? "resumed" : "paused", next);
 				if (status === "active" && ctx.isIdle()) queueContinuation(pi, next);
 				return;
@@ -373,15 +476,21 @@ export default function piGoal(pi: ExtensionAPI) {
 		},
 	});
 
-	pi.on("session_start", (event, ctx) => {
+	function restoreBranch(ctx: ExtensionContext) {
 		const restored = latestStateFromSession(ctx);
 		goal = restored.goal;
 		statusBarEnabled = restored.statusBarEnabled;
 		continuationQueued = false;
 		activeTurnStartedAt = null;
 		activeGoalThisTurnId = null;
-		// Keep create_goal available, and hide read/update tools unless there is an active goal to pursue.
 		syncGoalTools(pi);
+		updateStatusBar(ctx);
+	}
+
+	pi.on("session_tree", (_event, ctx) => restoreBranch(ctx));
+
+	pi.on("session_start", (event, ctx) => {
+		restoreBranch(ctx);
 		if (goal?.status === "active" && event.reason === "reload") {
 			// Reload pauses an active goal so it does not silently resume.
 			// We do not emit a goal event — the LLM has nothing to do here —
@@ -394,7 +503,6 @@ export default function piGoal(pi: ExtensionAPI) {
 			);
 			return;
 		}
-		updateStatusBar(ctx);
 		if (goal?.status === "active") {
 			// Fresh session_start with an active goal restored from disk.
 			// Notify the human; the next agent_end will deliver the full
@@ -426,6 +534,30 @@ export default function piGoal(pi: ExtensionAPI) {
 		if (next.status === "budget_limited") {
 			emitGoalEvent(pi, "budget_limited", next, { triggerTurn: true, deliverAs: "followUp" });
 		}
+	});
+
+	pi.on("before_agent_start", (event, ctx) => {
+		onCompletion(ctx);
+		if (event.messageType === "custom") onCompletion(ctx, event.message);
+	});
+
+	pi.on("message_start", (event, ctx) => onCompletion(ctx, event.message));
+	pi.on("context", (event, ctx) => {
+		// Refresh the model-facing barrier per request, including notices delivered
+		// as steering inside a turn. Keep it ephemeral rather than adding a wake.
+		for (const message of event.messages) {
+			if (message.role === "custom" && message.customType === "subagent-notify") onCompletion(ctx, message);
+		}
+		if (goal?.status !== "active" || !goal.wait) return;
+		return {
+			messages: [...event.messages, {
+				role: "custom" as const,
+				customType: "pi-goal-wait-context",
+				content: `The goal has a subagent dependency barrier. ${waitDescription(goal.wait)} Do not take dependent actions until all required results are verified. If a run was unsuccessful, report it without automatically retrying. Respond normally to user messages and supervisor questions.`,
+				display: false,
+				timestamp: Date.now(),
+			}],
+		};
 	});
 
 	pi.on("agent_end", (_event, ctx) => {
