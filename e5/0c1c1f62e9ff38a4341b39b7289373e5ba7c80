@@ -1,0 +1,27 @@
+README.md
+  s_348804a16c6f8f::t_a3e25a8278ac2d 38-39,65-66
+test/subagent-wait.test.cjs
+  s_348804a16c6f8f::t_72f1888a121a72 146-147,149,152-156,167-183
+  s_348804a16c6f8f::t_21c67662ccfe7c 84,88-145,148,150-151,157-166,184
+  s_348804a16c6f8f::t_456cb4144509f9 185
+.pi/extensions/pi-goal/goal-state.ts
+  s_348804a16c6f8f::t_e6ee0964a6f72f 16,19,69,89
+.pi/extensions/pi-goal/index.ts
+  s_348804a16c6f8f::t_50cd6c88dd53ef 31-45,60-61,157,261,422,465,505,543-546,564,566-574,577-584,603-618
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e50c1c1f62e9ff38a4341b39b7289373e5ba7c80",
+  "prompts": {},
+  "sessions": {
+    "s_348804a16c6f8f": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a208df-b1cb-762d-8538-132942b34a15",
+        "model": "gpt-6.2-sol"
+      },
+      "human_author": "Derek Santos <dersanto@cisco.com>"
+    }
+  }
+}
