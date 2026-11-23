@@ -13,9 +13,10 @@ export type GoalState = {
 	createdAt: number;
 	updatedAt: number;
 	wait?: RunWait;
+	stallSummary?: string;
 };
 
-export type GoalEventKind = "active" | "continuation" | "paused" | "resumed" | "cleared" | "budget_limited" | "complete";
+export type GoalEventKind = "active" | "continuation" | "paused" | "resumed" | "stalled" | "cleared" | "budget_limited" | "complete";
 
 export function parseTokenBudget(input: string): { objective: string; tokenBudget: number | null; error?: string } {
 	const match = input.match(/(?:^|\s)--tokens(?:=|\s+)(\S+\s*[kKmM]?)(?:\s|$)/);
@@ -65,7 +66,7 @@ export function statusLine(state: GoalState | null): string | undefined {
 		? `Goal waiting on ${state.wait.pending.length} subagent run(s)${budget}`
 		: "Goal blocked on subagent results (/goal resume)";
 	if (state.status === "active") return `Pursuing goal${budget}`;
-	if (state.status === "paused") return "Goal paused (/goal resume)";
+	if (state.status === "paused") return state.stallSummary ? "Goal needs input (/goal resume)" : "Goal paused (/goal resume)";
 	if (state.status === "budget_limited") return state.tokenBudget ? `Goal unmet${budget}` : "Goal abandoned";
 	return `Goal achieved${budget}`;
 }
@@ -85,6 +86,7 @@ export function goalEventStatus(kind: GoalEventKind): string {
 		active: "active",
 		continuation: "continuing",
 		paused: "paused",
+		stalled: "needs human input",
 		resumed: "resumed",
 		cleared: "cleared",
 		budget_limited: "budget reached",

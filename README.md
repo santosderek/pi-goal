@@ -35,6 +35,8 @@ When a goal is active, the extension shows compact visible lifecycle markers lik
 
 The same Pi agent keeps running normal turns in the same session context until it calls `update_goal({ status: "complete" })`, the user pauses/clears it, or the token budget is reached. Reloading Pi pauses an active goal instead of silently resuming it; use `/goal resume` to continue.
 
+If an automatic continuation settles without executing a work tool, the goal pauses for human input instead of starting another turn. The notice and `/goal status` show a short excerpt of the last assistant response, or a fallback when no response text is available. Goal-management calls such as `get_goal` do not count as work. Review the blocker, then use `/goal resume` to try again or `/goal clear` to stop. This guard applies to automatic continuations, not the initial user turn or a native subagent wake.
+
 ## What it adds
 
 - `pi-goal-writer` skill: draft and review strong `/goal` objectives with evidence-based success criteria
@@ -60,7 +62,8 @@ The same Pi agent keeps running normal turns in the same session context until i
   -> deliver continuation instructions as the marker's message content
   -> trigger an agent turn
   -> account time/tokens on turn_end
-  -> queue another continuation on agent_end while active
+  -> after agent_settled, pause with a summary if an automatic cycle ran no work tool
+  -> otherwise queue another continuation while active and not waiting
   -> stop when update_goal marks complete, user pauses/clears, or budget is hit
 ```
 

@@ -28,6 +28,21 @@ let statusBarEnabled = true;
 let activeTurnStartedAt: number | null = null;
 let activeGoalThisTurnId: string | null = null;
 let continuationQueued = false;
+let automaticRun: { goalId: string; usedWorkTool: boolean; summary: string } | undefined;
+
+function observeRunInput(value: unknown) {
+	const message = record(value);
+	if (message?.role === "user") automaticRun = undefined;
+	const details = record(message?.details);
+	if (!goal || goal.status !== "active" || message?.customType !== EVENT_TYPE ||
+		details?.kind !== "continuation" || record(details.goal)?.id !== goal.id) return;
+	// The same starting message can arrive through both lifecycle hooks.
+	automaticRun ??= { goalId: goal.id, usedWorkTool: false, summary: "" };
+}
+
+function stalledNotice(state: GoalState): string {
+	return `Goal needs human input: the automatic continuation ended without running a work tool, so another automatic turn may repeat the same response.\n\nLast assistant summary: ${state.stallSummary}\n\nReview the blocker, then use /goal resume to try again or /goal clear to stop.`;
+}
 
 // The `content` field is what the LLM sees in the conversation history.
 // Every goal event MUST carry actionable text — never a cryptic marker.
@@ -42,6 +57,8 @@ function goalContentForLLM(kind: GoalEventKind, state: GoalState): string {
 			return budgetLimitPrompt(state);
 		case "paused":
 			return `The active goal has been paused by the user. Stop pursuing it for now and wait for further instructions.\n\nObjective: ${state.objective}`;
+		case "stalled":
+			return stalledNotice(state);
 		case "cleared":
 			return `The active goal has been cleared by the user. Stop pursuing it.\n\nObjective was: ${state.objective}`;
 		case "complete":
@@ -137,6 +154,7 @@ Budget:
 - Tokens remaining: ${remainingTokens}
 
 Avoid repeating work that is already done. Choose the next concrete action toward the objective.
+If no useful action is available without human input, summarize the blocker and the decision or evidence needed. Do not call a tool just to keep the goal running.
 If only already-launched native async subagent runs can unblock the next step, use goal_wait_for_runs with their exact IDs and yield. Do not poll, relaunch, or treat a notice for one run as completion of the whole batch. Verify results before using them.
 
 Before deciding that the goal is achieved, perform a completion audit against the actual current state:
@@ -240,6 +258,7 @@ export default function piGoal(pi: ExtensionAPI) {
 		if (state) {
 			lines.push(`${theme.fg("dim", "Goal: ")}${theme.fg("customMessageText", state.objective)}`);
 			lines.push(`${theme.fg("dim", "Usage: ")}${theme.fg("customMessageText", goalUsage(state))}`);
+			if (kind === "stalled") lines.push(stalledNotice(state));
 		}
 		box.addChild(new Text(lines.join("\n"), 0, 0));
 		return box;
@@ -400,7 +419,7 @@ export default function piGoal(pi: ExtensionAPI) {
 
 			if (!trimmed || trimmed === "status") {
 				if (!goal) ctx.ui.notify("Usage: /goal [--tokens 50k] <objective>", "info");
-				else ctx.ui.notify(`${statusLine(goal)}\nObjective: ${goal.objective}${goal.wait ? `\n${waitDescription(goal.wait)}` : ""}\nStatus bar: ${statusBarEnabled ? "on" : "off"}`, "info");
+				else ctx.ui.notify(`${statusLine(goal)}\nObjective: ${goal.objective}${goal.wait ? `\n${waitDescription(goal.wait)}` : ""}${goal.stallSummary ? `\n${stalledNotice(goal)}` : ""}\nStatus bar: ${statusBarEnabled ? "on" : "off"}`, "info");
 				return;
 			}
 
@@ -443,7 +462,7 @@ export default function piGoal(pi: ExtensionAPI) {
 					reconciledSummary = waitDescription(wait);
 					if (!wait.pending.length) wait = undefined;
 				}
-				const next = { ...prior, wait, status, updatedAt: now };
+				const next = { ...prior, wait, status, stallSummary: status === "active" ? undefined : prior.stallSummary, updatedAt: now };
 				persist(pi, ctx, next);
 				if (status === "active" && wait) {
 					ctx.ui.notify(`Goal still waiting. ${waitDescription(wait)}`, "info");
@@ -483,6 +502,7 @@ export default function piGoal(pi: ExtensionAPI) {
 		continuationQueued = false;
 		activeTurnStartedAt = null;
 		activeGoalThisTurnId = null;
+		automaticRun = undefined;
 		syncGoalTools(pi);
 		updateStatusBar(ctx);
 	}
@@ -520,6 +540,10 @@ export default function piGoal(pi: ExtensionAPI) {
 	});
 
 	pi.on("turn_end", (event, ctx) => {
+		if (automaticRun && automaticRun.goalId === goal?.id && event.message?.role === "assistant") {
+			const summary = event.message.content.flatMap((part) => part.type === "text" ? [part.text] : []).join(" ");
+			if (summary.trim()) automaticRun.summary = truncateObjective(summary, 600);
+		}
 		if (!goal || activeGoalThisTurnId !== goal.id) {
 			activeTurnStartedAt = null;
 			activeGoalThisTurnId = null;
@@ -537,11 +561,27 @@ export default function piGoal(pi: ExtensionAPI) {
 	});
 
 	pi.on("before_agent_start", (event, ctx) => {
+		automaticRun = undefined;
 		onCompletion(ctx);
-		if (event.messageType === "custom") onCompletion(ctx, event.message);
+		if (event.messageType === "custom") {
+			onCompletion(ctx, event.message);
+			observeRunInput(event.message);
+		}
 	});
 
-	pi.on("message_start", (event, ctx) => onCompletion(ctx, event.message));
+	pi.on("message_start", (event, ctx) => {
+		onCompletion(ctx, event.message);
+		observeRunInput(event.message);
+	});
+
+	pi.on("tool_execution_end", (event) => {
+		// Rejected calls never execute and have no duration. Goal bookkeeping
+		// alone does not advance the work (e.g. repeatedly calling get_goal).
+		if (automaticRun && event.durationMs !== undefined &&
+			!ACTIVE_GOAL_TOOL_NAMES.includes(event.toolName) && event.toolName !== "create_goal") {
+			automaticRun.usedWorkTool = true;
+		}
+	});
 	pi.on("context", (event, ctx) => {
 		// Refresh the model-facing barrier per request, including notices delivered
 		// as steering inside a turn. Keep it ephemeral rather than adding a wake.
@@ -560,8 +600,22 @@ export default function piGoal(pi: ExtensionAPI) {
 		};
 	});
 
-	pi.on("agent_end", (_event, ctx) => {
-		if (!goal || goal.status !== "active" || ctx.hasPendingMessages()) return;
+	pi.on("agent_settled", (event, ctx) => {
+		const run = automaticRun;
+		automaticRun = undefined;
+		if (event.aborted || !goal || goal.status !== "active" || goal.wait || ctx.hasPendingMessages()) return;
+		if (run?.goalId === goal.id && !run.usedWorkTool) {
+			const next: GoalState = {
+				...goal,
+				status: "paused",
+				stallSummary: run.summary || "No assistant text was available. Review the preceding turn for the blocker.",
+				updatedAt: Date.now(),
+			};
+			persist(pi, ctx, next);
+			emitGoalEvent(pi, "stalled", next, { triggerTurn: false });
+			ctx.ui.notify(stalledNotice(next), "warning");
+			return;
+		}
 		queueContinuation(pi, goal);
 	});
 }

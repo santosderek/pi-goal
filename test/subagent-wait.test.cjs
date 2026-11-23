@@ -81,9 +81,107 @@ async function start() {
 }
 
 async function end(h) {
-	h.hook('agent_end');
+	h.hook('agent_settled', { aborted: false });
 	await Promise.resolve();
 }
+
+function startAutomatic(h) {
+	const message = h.sent.findLast(({ message }) => message.details?.kind === 'continuation').message;
+	h.hook('before_agent_start', { messageType: 'custom', message });
+	h.hook('message_start', { message: { role: 'custom', ...message } });
+}
+
+function answer(h, text) {
+	h.hook('turn_end', { message: { role: 'assistant', content: [
+		{ type: 'thinking', thinking: 'not public' }, { type: 'text', text },
+	] } });
+}
+
+test('tool-free automatic response pauses once, persists its summary, and waits for explicit resume', async () => {
+	const h = await start();
+	h.hook('before_agent_start', { messageType: 'user' });
+	answer(h, 'Initial response');
+	await end(h);
+	assert.equal(h.continuations, 1);
+	startAutomatic(h);
+	answer(h, 'Blocked: need approval\nfor a local patch.');
+	await end(h);
+	await end(h);
+	assert.equal(h.continuations, 1);
+	assert.equal(h.goal.status, 'paused');
+	assert.equal(h.goal.stallSummary, 'Blocked: need approval for a local patch.');
+	assert.match(h.notifications.at(-1), /without running a work tool.*\n\nLast assistant summary: Blocked:/);
+	const notices = h.sent.filter(({ message }) => message.details?.kind === 'stalled');
+	assert.equal(notices.length, 1);
+	assert.equal(notices[0].options.triggerTurn, false);
+	const restored = harness(h.branch);
+	restored.hook('session_start', { reason: 'startup' });
+	await restored.command('status');
+	assert.match(restored.notifications.at(-1), /need approval/);
+	await end(restored);
+	assert.equal(restored.continuations, 0);
+	await restored.command('resume');
+	assert.equal(restored.goal.stallSummary, undefined);
+	assert.equal(restored.continuations, 1);
+});
+
+test('work in an earlier tool round counts, but bookkeeping and unexecuted calls do not', async () => {
+	const h = await start();
+	await end(h);
+	startAutomatic(h);
+	h.hook('tool_execution_end', { toolName: 'bash', durationMs: 0 });
+	answer(h, 'Checked the worktree');
+	h.hook('turn_start');
+	answer(h, 'Ready for the next step');
+	await end(h);
+	assert.equal(h.continuations, 2);
+	startAutomatic(h);
+	h.hook('tool_execution_end', { toolName: 'get_goal', durationMs: 1 });
+	h.hook('tool_execution_end', { toolName: 'bash', isError: true });
+	await end(h);
+	assert.equal(h.goal.status, 'paused');
+	assert.match(h.goal.stallSummary, /No assistant text/);
+});
+
+test('completion, budget exhaustion, a subagent barrier and abort take precedence over a stall', async () => {
+	for (const scenario of ['complete', 'budget', 'wait', 'abort']) {
+		const h = await start();
+		if (scenario === 'budget') await h.tool('create_goal', { objective: 'Budgeted test', tokenBudget: 2 });
+		await end(h);
+		startAutomatic(h);
+		if (scenario === 'budget') {
+			h.hook('turn_start');
+			h.hook('turn_end', { message: { role: 'assistant', content: [], usage: { totalTokens: 2 } } });
+			assert.equal(h.goal.status, 'budget_limited');
+		}
+		if (scenario === 'complete') await h.tool('update_goal', { status: 'complete' });
+		if (scenario === 'wait') {
+			h.launch('pending');
+			await h.tool('goal_wait_for_runs', { runIds: ['pending'] });
+		}
+		h.hook('agent_settled', { aborted: scenario === 'abort' });
+		await Promise.resolve();
+		assert.equal(h.continuations, 1);
+		assert.equal(h.goal.stallSummary, undefined);
+	}
+});
+
+test('recognizes queued continuation delivery and does not mistake human steering for a stall', async () => {
+	const h = await start();
+	await end(h);
+	const message = h.sent.at(-1).message;
+	h.hook('message_start', { message: { role: 'custom', ...message } });
+	h.hook('message_start', { message: { role: 'user', content: 'Please explain the options first' } });
+	answer(h, 'Options explained');
+	await end(h);
+	assert.equal(h.goal.status, 'active');
+	assert.equal(h.continuations, 2);
+	h.hook('message_start', { message: { role: 'custom', ...h.sent.at(-1).message } });
+	answer(h, 'Need a decision');
+	await end(h);
+	assert.equal(h.goal.status, 'paused');
+	assert.equal(h.goal.stallSummary, 'Need a decision');
+});
 
 const run = (runId, status = 'completed') => ({ runId, status });
 
