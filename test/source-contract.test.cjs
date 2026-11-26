@@ -27,13 +27,15 @@ test("create_goal uses upsert semantics for explicitly requested goals", () => {
 	assert.doesNotMatch(indexSource, /This thread already has a goal/);
 });
 
-test("update_goal remains completion-only in schema and guidance", () => {
+test("update_goal can complete verified work or pause while blocked on user input", () => {
 	assert.match(indexSource, /name: "update_goal"/);
-	assert.match(indexSource, /enum: \["complete"\]/);
-	assert.match(indexSource, /Do not use update_goal to pause, resume, abandon, or budget-limit a goal/);
+	assert.match(indexSource, /enum: \["complete", "paused"\]/);
+	assert.match(indexSource, /Use update_goal with status paused when progress requires a user decision/);
+	assert.match(indexSource, /Do not keep repeating the same question in autonomous turns/);
 });
 
 test("README documents the model-set goal and completion accounting contracts", () => {
 	assert.match(readme, /`create_goal` tool: model can set or replace the current goal only when explicitly requested/);
-	assert.match(readme, /The final turn is still accounted even when the model completes the goal mid-turn/);
+	assert.match(readme, /The final turn is still accounted even when the model completes or pauses the goal mid-turn/);
+	assert.match(readme, /Continuations are requested only at Pi's final settle boundary after a completed run/);
 });

@@ -8,6 +8,7 @@ import {
 	parseTokenBudget,
 	statusLine,
 	truncateObjective,
+	shouldContinueGoal,
 	type GoalEventKind,
 	type GoalState,
 	type GoalStatus,
@@ -36,7 +37,7 @@ function goalContentForLLM(kind: GoalEventKind, state: GoalState): string {
 		case "budget_limited":
 			return budgetLimitPrompt(state);
 		case "paused":
-			return `The active goal has been paused by the user. Stop pursuing it for now and wait for further instructions.\n\nObjective: ${state.objective}`;
+			return `The active goal is paused. Stop pursuing it and wait for the user to resume or provide new instructions.\n\nObjective: ${state.objective}`;
 		case "cleared":
 			return `The active goal has been cleared by the user. Stop pursuing it.\n\nObjective was: ${state.objective}`;
 		case "complete":
@@ -48,25 +49,27 @@ function goalContentForLLM(kind: GoalEventKind, state: GoalState): string {
 // always derived from `kind` + `state` so it cannot drift back into the
 // "cryptic marker" failure mode. Human-only notices belong in ctx.ui.notify,
 // not here.
+function goalEventEntry(kind: GoalEventKind, state: GoalState) {
+	return {
+		type: "custom_message" as const,
+		customType: EVENT_TYPE,
+		content: goalContentForLLM(kind, state),
+		display: true,
+		details: {
+			kind,
+			goal: state,
+			timestamp: Date.now(),
+		},
+	};
+}
+
 function emitGoalEvent(
 	pi: ExtensionAPI,
 	kind: GoalEventKind,
 	state: GoalState,
 	options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 ) {
-	pi.sendMessage(
-		{
-			customType: EVENT_TYPE,
-			content: goalContentForLLM(kind, state),
-			display: true,
-			details: {
-				kind,
-				goal: state,
-				timestamp: Date.now(),
-			},
-		},
-		options,
-	);
+	pi.sendMessage(goalEventEntry(kind, state), options);
 }
 
 function latestStateFromSession(ctx: ExtensionContext): { goal: GoalState | null; statusBarEnabled: boolean } {
@@ -141,10 +144,11 @@ Before deciding that the goal is achieved, perform a completion audit against th
 - Do not accept proxy signals as completion by themselves. Passing tests, a complete manifest, a successful verifier, or substantial implementation effort are useful evidence only if they cover every requirement in the objective.
 - Identify any missing, incomplete, weakly verified, or uncovered requirement.
 - Treat uncertainty as not achieved; do more verification or continue the work.
+- If progress is blocked on a user decision, permission, unavailable dependency, or another input only the user can provide, call update_goal with status "paused" and explain the exact blocker and next input needed. Do not keep repeating the same question in autonomous turns.
 
 Do not rely on intent, partial progress, elapsed effort, memory of earlier work, or a plausible final answer as proof of completion. Only mark the goal achieved when the audit shows that the objective has actually been achieved and no required work remains. If any requirement is missing, incomplete, or unverified, keep working instead of marking the goal complete. If the objective is achieved, call update_goal with status \"complete\" so usage accounting is preserved.
 
-Do not call update_goal unless the goal is complete. Do not mark a goal complete merely because the budget is nearly exhausted or because you are stopping work.`;
+Do not mark a goal complete merely because the budget is nearly exhausted or because you are stopping work. Use status "paused" when waiting for user input; do not use it when useful, safe work remains.`;
 }
 
 function budgetLimitPrompt(state: GoalState): string {
@@ -269,35 +273,36 @@ export default function piGoal(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "update_goal",
 		label: "Update Goal",
-		description: "Mark the current thread goal complete. This tool only accepts status=complete and final turn usage is accounted by the runtime.",
-		promptSnippet: "Mark the current goal complete after a strict completion audit",
+		description: "Mark the current thread goal complete after verification, or pause it while blocked on user input. Final turn usage is accounted by the runtime.",
+		promptSnippet: "Mark the current goal complete after a strict audit, or pause it when blocked on user input",
 		promptGuidelines: [
-			"Use update_goal only when the current pi-goal objective is fully achieved and verified against concrete evidence.",
-			"Do not use update_goal to pause, resume, abandon, or budget-limit a goal.",
+			"Use update_goal with status complete only when the current pi-goal objective is fully achieved and verified against concrete evidence.",
+			"Use update_goal with status paused when progress requires a user decision, permission, or other input the agent cannot obtain; then explain the exact blocker and next input needed.",
+			"Do not pause a goal merely because a turn ended when useful, safe work remains.",
 		],
 		parameters: {
 			type: "object",
 			properties: {
 				status: {
 					type: "string",
-					enum: ["complete"],
-					description: "Only complete is accepted.",
+					enum: ["complete", "paused"],
+					description: "Use complete only after verification, or paused when blocked waiting for user input.",
 				},
 			},
 			required: ["status"],
 			additionalProperties: false,
 		} as any,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			if (params.status !== "complete") {
-				return { content: [{ type: "text", text: "update_goal only accepts status=complete." }], isError: true };
+			if (params.status !== "complete" && params.status !== "paused") {
+				return { content: [{ type: "text", text: "update_goal accepts status=complete or status=paused." }], isError: true };
 			}
 			if (!goal) {
 				return { content: [{ type: "text", text: "No goal is set." }], isError: true };
 			}
 			const now = Date.now();
-			const next: GoalState = { ...goal, status: "complete", updatedAt: now };
+			const next: GoalState = { ...goal, status: params.status, updatedAt: now };
 			persist(pi, ctx, next);
-			emitGoalEvent(pi, "complete", next);
+			emitGoalEvent(pi, params.status === "complete" ? "complete" : "paused", next);
 			return {
 				content: [{ type: "text", text: JSON.stringify({ goal: next, remainingTokens: next.tokenBudget == null ? null : Math.max(0, next.tokenBudget - next.tokensUsed) }, null, 2) }],
 				details: { goal: next },
@@ -397,8 +402,8 @@ export default function piGoal(pi: ExtensionAPI) {
 		updateStatusBar(ctx);
 		if (goal?.status === "active") {
 			// Fresh session_start with an active goal restored from disk.
-			// Notify the human; the next agent_end will deliver the full
-			// continuation prompt to the LLM via queueContinuation.
+			// Notify the human; the next completed run will deliver the full
+			// continuation prompt at agent_before_settle.
 			ctx.ui.notify(
 				`⚑ Goal restored: ${truncateObjective(goal.objective)}\nUse /goal pause to stop continuation, or /goal clear to remove it.`,
 				"info",
@@ -428,8 +433,14 @@ export default function piGoal(pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("agent_end", (_event, ctx) => {
-		if (!goal || goal.status !== "active" || ctx.hasPendingMessages()) return;
-		queueContinuation(pi, goal);
+	pi.on("agent_before_settle", (event) => {
+		if (
+			!goal ||
+			!shouldContinueGoal(goal.status, event.outcome, event.context.pendingMessages.length, event.continue)
+		) return;
+		return {
+			entries: [...event.entries, goalEventEntry("continuation", goal)],
+			continue: true,
+		};
 	});
 }

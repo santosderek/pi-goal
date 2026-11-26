@@ -46,7 +46,7 @@ The same Pi agent keeps running normal turns in the same session context until i
 - `/goal statusbar on|off`: show or hide the footer status line
 - `create_goal` tool: model can set or replace the current goal only when explicitly requested
 - `get_goal` tool: read current goal state
-- `update_goal` tool: model can only mark the goal `complete`
+- `update_goal` tool: model can mark verified work `complete` or pause when blocked on user input
 - `get_goal` and `update_goal` are only exposed to the model while a goal is `active`; paused, cleared, complete, and budget-limited goals hide them so unrelated sessions are not tempted to call them
 - footer status: `Pursuing goal`, `Goal paused`, `Goal achieved`, or `Goal unmet`
 
@@ -59,13 +59,14 @@ The same Pi agent keeps running normal turns in the same session context until i
   -> deliver continuation instructions as the marker's message content
   -> trigger an agent turn
   -> account time/tokens on turn_end
-  -> queue another continuation on agent_end while active
+  -> queue another continuation at agent_before_settle after successful work
+  -> stop on provider errors or aborts; pause when blocked on user input
   -> stop when update_goal marks complete, user pauses/clears, or budget is hit
 ```
 
 ## Completion behavior
 
-The model is instructed to audit completion against real evidence before calling `update_goal`. The `update_goal` tool deliberately accepts only `status: "complete"`; pausing, resuming, clearing, and budget limiting are controlled by the user or extension runtime. The final turn is still accounted even when the model completes the goal mid-turn.
+The model is instructed to audit completion against real evidence before calling `update_goal`. The tool accepts `status: "complete"` only after a strict evidence audit, or `status: "paused"` when progress requires user input. Pausing, resuming, and clearing are also available to the user; budget limiting is controlled by the extension runtime. Continuations are requested only at Pi's final settle boundary after a completed run, so provider errors and aborted runs do not create retry loops. The final turn is still accounted even when the model completes or pauses the goal mid-turn.
 
 ## State
 

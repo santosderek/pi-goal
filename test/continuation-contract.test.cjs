@@ -11,3 +11,10 @@ test("persisting a non-active goal cancels any queued continuation", () => {
 		/if \(next\?\.status !== "active"\) \{\s*continuationQueued = false;\s*\}/,
 	);
 });
+
+test("goal continuation is scheduled only at the final settle boundary after successful work", () => {
+	assert.match(indexSource, /pi\.on\("agent_before_settle"/);
+	assert.match(indexSource, /shouldContinueGoal\(goal\.status, event\.outcome, event\.context\.pendingMessages\.length, event\.continue\)/);
+	assert.doesNotMatch(indexSource, /pi\.on\("agent_end"/);
+	assert.match(indexSource, /entries: \[\.\.\.event\.entries, goalEventEntry\("continuation", goal\)\]/);
+});

@@ -9,6 +9,7 @@ const {
 	formatElapsed,
 	formatTokens,
 	goalEventStatus,
+	shouldContinueGoal,
 	goalUsage,
 	normalizeTokenBudget,
 	parseTokenBudget,
@@ -109,6 +110,16 @@ test("goalUsage prefers token budget usage when budgeted", () => {
 test("truncateObjective collapses whitespace and truncates at max", () => {
 	assert.equal(truncateObjective("  one\n two\tthree  "), "one two three");
 	assert.equal(truncateObjective("abcdef", 4), "abc…");
+});
+
+test("shouldContinueGoal only schedules successful active runs without queued work", () => {
+	assert.equal(shouldContinueGoal("active", "completed", 0), true);
+	assert.equal(shouldContinueGoal("paused", "completed", 0), false);
+	assert.equal(shouldContinueGoal("complete", "completed", 0), false);
+	assert.equal(shouldContinueGoal("active", "error", 0), false);
+	assert.equal(shouldContinueGoal("active", "aborted", 0), false);
+	assert.equal(shouldContinueGoal("active", "completed", 1), false);
+	assert.equal(shouldContinueGoal("active", "completed", 0, true), false);
 });
 
 test("goalEventStatus maps event kinds to display labels", () => {

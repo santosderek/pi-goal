@@ -74,6 +74,15 @@ export function truncateObjective(objective: string, max = 96): string {
 	return singleLine.length > max ? `${singleLine.slice(0, max - 1)}…` : singleLine;
 }
 
+export function shouldContinueGoal(
+	status: GoalStatus | null | undefined,
+	outcome: "completed" | "aborted" | "error",
+	pendingMessageCount: number,
+	continuationRequested = false,
+): boolean {
+	return status === "active" && outcome === "completed" && pendingMessageCount === 0 && !continuationRequested;
+}
+
 export function goalEventStatus(kind: GoalEventKind): string {
 	const labels: Record<GoalEventKind, string> = {
 		active: "active",
